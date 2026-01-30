@@ -34,16 +34,49 @@ static FLTScreenshotFlutterApi *screenshotFlutterApi;
 
 - (FlutterStandardTypedData *)takeScreenshot {
     @try {
-        UIApplication *app=  [UIApplication sharedApplication];
-        UIView *view= [[[[app delegate] window] rootViewController] view];
+        UIApplication *app = [UIApplication sharedApplication];
+        UIWindow *window = [[app delegate] window];
+        if (!window) {
+             if (@available(iOS 13.0, *)) {
+                 for (UIScene *scene in [app connectedScenes]) {
+                     if ([scene isKindOfClass:[UIWindowScene class]]) {
+                         UIWindowScene *windowScene = (UIWindowScene *)scene;
+                         for (UIWindow *w in windowScene.windows) {
+                             if ([w isKeyWindow]) {
+                                 window = w;
+                                 break;
+                             }
+                         }
+                     }
+                     if (window) break;
+                 }
+             }
+        }
         
-        UIGraphicsBeginImageContextWithOptions([view bounds].size,[view isOpaque],[UIScreen mainScreen].scale);
+        // Fallback for older iOS versions or if scene finding failed
+        if (!window) {
+             for (UIWindow *w in [app windows]) {
+                 if ([w isKeyWindow]) {
+                     window = w;
+                     break;
+                 }
+             }
+        }
         
-        [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:TRUE];
+        UIView *view = window;
+        if (!view || view.bounds.size.width <= 0 || view.bounds.size.height <= 0) {
+             NSLog(@"[FfNativeScreenshotPlugin] Error: View is nil or has zero size. Window: %@", window);
+             return nil;
+        }
+
+        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+        format.scale = window.screen.scale;
+        format.opaque = [view isOpaque];
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:view.bounds.size format:format];
         
-        UIImage *image= UIGraphicsGetImageFromCurrentImageContext();
-        
-        UIGraphicsEndImageContext();
+        UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull rendererContext) {
+            [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:TRUE];
+        }];
         
         
         NSData *imageData= UIImageJPEGRepresentation(image, 1.0f);
@@ -59,3 +92,4 @@ static FLTScreenshotFlutterApi *screenshotFlutterApi;
 }
 
 @end
+
