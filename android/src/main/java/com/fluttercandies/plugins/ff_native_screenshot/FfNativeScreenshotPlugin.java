@@ -14,7 +14,9 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.PixelCopy;
+import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.webkit.MimeTypeMap;
 
@@ -28,13 +30,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import kotlin.jvm.internal.Intrinsics;
 
 /**
  * FfNativeScreenshotPlugin
  */
 public class FfNativeScreenshotPlugin implements FlutterPlugin, ScreenshotApi.ScreenshotHostApi {
 
+    private static final String TAG = "FfNativeScreenshot";
     private ScreenshotApi.ScreenshotFlutterApi screenshotFlutterApi;
     private Context context;
     private ActivityLifecycleCallbacks callbacks = new ActivityLifecycleCallbacks();
@@ -64,46 +66,108 @@ public class FfNativeScreenshotPlugin implements FlutterPlugin, ScreenshotApi.Sc
 
     @Override
     public void takeScreenshot(ScreenshotApi.Result<byte[]> result) {
-
-//    ActivityManager am = (ActivityManager)context.getSystemService(Context.ACTIVITY_SERVICE);
-//    ComponentName cn = am.getRunningTasks(1).get(0).topActivity;
-        if (callbacks.currentActivity != null) {
-            Activity activity = callbacks.currentActivity;
-            Window window = activity.getWindow();
-            View view = window.getDecorView();
-            final Bitmap bitmap;
-            try {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
-                    int[] location = new int[2];
-                    view.getLocationInWindow(location);
-                    PixelCopy.request(window, new Rect(location[0], location[1], location[0] + view.getWidth(), location[1] + view.getHeight()), bitmap, (PixelCopy.OnPixelCopyFinishedListener) (new PixelCopy.OnPixelCopyFinishedListener() {
-                        public final void onPixelCopyFinished(int it) {
-                            if (it == 0) {
-                                takeScreenshotResult(bitmap, result);
-                            } else {
-                                result.error(new Exception("fail to take screenshot"));
-                            }
-                        }
-                    }), new Handler(Looper.getMainLooper()));
-                } else {
-                    bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.RGB_565);
-                    Canvas canvas = new Canvas(bitmap);
-                    view.draw(canvas);
-                    canvas.setBitmap((Bitmap) null);
-                    Intrinsics.checkNotNullExpressionValue(bitmap, "tBitmap");
-                    takeScreenshotResult(bitmap, result);
-                }
-
-            } catch (Exception e) {
-                Log.e("takeScreenshot", e.getMessage());
-                result.error(e);
-            } finally {
-
-            }
-        } else {
+        if (callbacks.currentActivity == null) {
             result.success(null);
+            return;
         }
+
+        Activity activity = callbacks.currentActivity;
+        Window window = activity.getWindow();
+        View decorView = window.getDecorView();
+
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                SurfaceView surfaceView = findSurfaceView(decorView);
+                if (surfaceView != null
+                        && surfaceView.getHolder().getSurface() != null
+                        && surfaceView.getHolder().getSurface().isValid()) {
+                    takeSurfaceScreenshot(surfaceView, result, () -> {
+                        takeWindowScreenshot(window, decorView, result);
+                    });
+                } else {
+                    takeWindowScreenshot(window, decorView, result);
+                }
+            } else {
+                takeSoftwareScreenshot(decorView, result);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "takeScreenshot: " + e.getMessage());
+            result.error(e);
+        }
+    }
+
+    private void takeSurfaceScreenshot(SurfaceView surfaceView, ScreenshotApi.Result<byte[]> result, Runnable fallback) {
+        int width = surfaceView.getWidth() > 0 ? surfaceView.getWidth() : 1;
+        int height = surfaceView.getHeight() > 0 ? surfaceView.getHeight() : 1;
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+
+        try {
+            PixelCopy.request(surfaceView, bitmap, copyResult -> {
+                if (copyResult == PixelCopy.SUCCESS) {
+                    takeScreenshotResult(bitmap, result);
+                } else {
+                    Log.w(TAG, "SurfaceView PixelCopy failed (" + copyResult + "), falling back to Window");
+                    bitmap.recycle();
+                    fallback.run();
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "SurfaceView PixelCopy threw IllegalArgumentException", e);
+            bitmap.recycle();
+            fallback.run();
+        }
+    }
+
+    private void takeWindowScreenshot(Window window, View decorView, ScreenshotApi.Result<byte[]> result) {
+        int width = decorView.getWidth();
+        int height = decorView.getHeight();
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] loc = new int[2];
+        decorView.getLocationInWindow(loc);
+
+        try {
+            PixelCopy.request(window, new Rect(loc[0], loc[1], loc[0] + width, loc[1] + height), bitmap, copyResult -> {
+                if (copyResult == PixelCopy.SUCCESS) {
+                    takeScreenshotResult(bitmap, result);
+                } else {
+                    Log.w(TAG, "Window PixelCopy failed (" + copyResult + "), falling back to View.draw");
+                    bitmap.recycle();
+                    takeSoftwareScreenshot(decorView, result);
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Window PixelCopy threw IllegalArgumentException", e);
+            bitmap.recycle();
+            takeSoftwareScreenshot(decorView, result);
+        }
+    }
+
+    private void takeSoftwareScreenshot(View view, ScreenshotApi.Result<byte[]> result) {
+        int width = view.getWidth();
+        int height = view.getHeight();
+        if (width <= 0 || height <= 0) {
+            result.error(new Exception("Invalid view size: " + width + "x" + height));
+            return;
+        }
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        view.draw(canvas);
+        canvas.setBitmap(null);
+        takeScreenshotResult(bitmap, result);
+    }
+
+    private SurfaceView findSurfaceView(View view) {
+        if (view instanceof SurfaceView) {
+            return (SurfaceView) view;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                SurfaceView sv = findSurfaceView(group.getChildAt(i));
+                if (sv != null) return sv;
+            }
+        }
+        return null;
     }
 
     @Override
